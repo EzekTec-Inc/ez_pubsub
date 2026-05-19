@@ -1,5 +1,5 @@
-/// ez_pubsub — Smart Home Event System Demo
 ///
+/// ez_pubsub — Smart Home Event System Demo
 /// Showcases every feature of the crate:
 ///   • Multiple distinct events
 ///   • Multiple targets per event
@@ -11,7 +11,20 @@
 ///   • All three subscribe! macro forms
 ///   • Direct instance API (PubSub<T>)
 ///   • Global bus via broadcast! / subscribe! macros
-use ez_pubsub::{broadcast, subscribe, PubSub, SubOption};
+use ez_pubsub::{PubSub, SubOption, broadcast, subscribe};
+
+// ── TUI Instantiation─────────────────────────────────────────────────────────────────
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::{
+    DefaultTerminal, Frame,
+    buffer::Buffer,
+    layout::Rect,
+    style::Stylize,
+    symbols::border,
+    text::{Line, Text},
+    widgets::{Block, Paragraph, Widget},
+};
+use std::io;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +66,10 @@ fn run_sensor_bus() {
         "living_room",
         SubOption::Once,
         |temp: &f32| {
-            println!("  [BOOT ALERT]  ✅  Sensor online, first reading: {}°C", temp);
+            println!(
+                "  [BOOT ALERT]  ✅  Sensor online, first reading: {}°C",
+                temp
+            );
         },
     );
 
@@ -115,19 +131,17 @@ fn run_security_system() {
         "front_door",
         SubOption::Once,
         |location: &String| {
-            println!("  [PUSH]     📲  First motion detected at {} — notifying owner", location);
+            println!(
+                "  [PUSH]     📲  First motion detected at {} — notifying owner",
+                location
+            );
         }
     );
 
     // Medium form: name + target, defaults to Always
-    subscribe!(
-        "motion",
-        "motion_log",
-        "garage",
-        |location: &String| {
-            println!("  [LOG]      📝  Garage motion log: {}", location);
-        }
-    );
+    subscribe!("motion", "motion_log", "garage", |location: &String| {
+        println!("  [LOG]      📝  Garage motion log: {}", location);
+    });
 
     println!("  >> Motion event 1 (push fires once)");
     broadcast!("motion", "front_door at 09:01");
@@ -152,7 +166,10 @@ fn run_security_system() {
         SubOption::Always,
         |action: &String| {
             if action.contains("open") {
-                println!("  [LOCK]     🔓  Main entrance unlocked by event: {}", action);
+                println!(
+                    "  [LOCK]     🔓  Main entrance unlocked by event: {}",
+                    action
+                );
             } else {
                 println!("  [LOCK]     🔒  Main entrance locked by event: {}", action);
             }
@@ -186,7 +203,10 @@ fn run_security_system() {
         "security_panel",
         SubOption::Once,
         |level: &String| {
-            println!("  [AUTO-CALL]📞  Calling emergency services! Level: {}", level);
+            println!(
+                "  [AUTO-CALL]📞  Calling emergency services! Level: {}",
+                level
+            );
         }
     );
 
@@ -230,9 +250,144 @@ fn run_system_shutdown() {
     println!("  ✅  Confirmed: global bus is empty");
 }
 
+// ── TUI UI─────────────────────────────────────────────────────────────────
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Debug, Default, Clone)]
+pub struct App {
+    counter: Arc<AtomicU8>,
+    exit: bool,
+}
+
+impl App {
+    /// runs the application's main loop until the user quits
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        // register pubsub
+        let increment_clone = self.clone();
+        let decrement_clone = self.clone();
+
+        // how can I use the pubsub mechanism to increase the counter?
+        // Write the code for it
+        // is there a way to re-write the code block below to ensure the increment_counter is
+        // updated?
+        subscribe!(
+            "increment",
+            "security_camera",
+            "front_door",
+            SubOption::Always,
+            move |_: &String| {
+                let mut temp_inc_clone = increment_clone.clone();
+                temp_inc_clone.increment_counter();
+            }
+        );
+        subscribe!(
+            "decrement",
+            "security_camera",
+            "front_door",
+            SubOption::Always,
+            move |_: &String| {
+                let mut temp_dec_clone = decrement_clone.clone();
+                temp_dec_clone.decrement_counter();
+            }
+        );
+
+        while !self.exit {
+            terminal.draw(|frame| self.draw(frame))?;
+            self.handle_events()?;
+        }
+        Ok(())
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        frame.render_widget(self, frame.area());
+    }
+
+    fn handle_events(&mut self) -> io::Result<()> {
+        match event::read()? {
+            // it's important to check that the event is a key press events
+            // as crossterm also emits key release and repeat events in Windows.
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                self.handle_key_event(key_event)
+            }
+            _ => {}
+        };
+        Ok(())
+    }
+
+    fn handle_key_event(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.exit(),
+            KeyCode::Left => {
+                broadcast!("decrement", "front_door");
+                // self.decrement_counter()
+            }
+            KeyCode::Right => {
+                broadcast!("increment", "front_door");
+                // self.increment_counter()
+            }
+            _ => {}
+        }
+    }
+
+    fn exit(&mut self) {
+        self.exit = true;
+    }
+
+    fn decrement_counter(&mut self) {
+        if self.counter.load(Ordering::Relaxed) > 0 {
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn increment_counter(&mut self) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Widget for &App {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let title = Line::from(" Counter App Tutorial ".bold());
+        let instructions = Line::from(vec![
+            " Decrement ".into(),
+            "<left>".blue().bold(),
+            " Increment ".into(),
+            "<right>".blue().bold(),
+            " Quit ".into(),
+            "<Q>".red().bold(),
+        ]);
+        let block = Block::bordered()
+            .title(title.centered())
+            .title_bottom(instructions.centered())
+            .border_set(border::THICK);
+
+        let counter_text = Text::from(vec![
+            Line::from(vec![
+                "Value: ".into(),
+                self.counter
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string()
+                    .yellow(),
+            ]),
+            Line::from(vec![
+                "Second Value: ".into(),
+                self.counter
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string()
+                    .yellow(),
+            ]),
+        ]);
+
+        Paragraph::new(counter_text)
+            .centered()
+            .block(block)
+            .render(area, buf);
+    }
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-fn main() {
+fn main() -> io::Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════╗");
     println!("║        ez_pubsub — Smart Home Event System Demo       ║");
     println!("╚═══════════════════════════════════════════════════════╝");
@@ -244,4 +399,8 @@ fn main() {
     println!("\n╔═══════════════════════════════════════════════════════╗");
     println!("║                     Demo Complete                     ║");
     println!("╚═══════════════════════════════════════════════════════╝\n");
+
+    // Ok(())
+
+    ratatui::run(|terminal| App::default().run(terminal))
 }

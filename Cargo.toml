@@ -2,5 +2,18 @@
 name = "ez_pubsub"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight, thread-safe publish-subscribe event bus for Rust."
+license = "MIT"
+repository = "https://github.com/engr-uba/ez_pubsub"
+keywords = ["pubsub", "events", "event-bus", "broadcast", "messaging"]
+categories = ["concurrency", "rust-patterns"]
 
 [dependencies]
+parking_lot = "0.12.3"
+
+[dev-dependencies]
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util"] }
+ratatui = "0.30.0"
+crossterm = "0.29.0"
