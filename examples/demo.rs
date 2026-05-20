@@ -267,16 +267,13 @@ impl App {
         let increment_clone = self.clone();
         let decrement_clone = self.clone();
 
-        // how can I use the pubsub mechanism to increase the counter?
-        // Write the code for it
-        // is there a way to re-write the code block below to ensure the increment_counter is
-        // updated?
+        // NOTE: pubsub mechanism to increase the counter?
         subscribe!(
             "increment",
             "security_camera",
             "front_door",
             SubOption::Always,
-            move |_: &String| {
+            move |_: &_| {
                 let mut temp_inc_clone = increment_clone.clone();
                 temp_inc_clone.increment_counter();
             }
@@ -286,7 +283,7 @@ impl App {
             "security_camera",
             "front_door",
             SubOption::Always,
-            move |_: &String| {
+            move |_| {
                 let mut temp_dec_clone = decrement_clone.clone();
                 temp_dec_clone.decrement_counter();
             }

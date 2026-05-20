@@ -185,7 +185,6 @@ macro_rules! subscribe {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use futures::executor::block_on;
 
     #[test]
     fn test_always_and_once_subscriptions() {

@@ -1,3 +1,8 @@
 /target
 .cade/
+.claude/
 .fastembed_cache/
+.serena/
+.specify/
+node_modules/
+.cade-todo.md
