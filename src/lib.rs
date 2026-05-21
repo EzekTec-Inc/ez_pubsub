@@ -1,54 +1,186 @@
+//! A lightweight, thread-safe publish-subscribe event bus.
+//!
+//! `ez_pubsub` lets you register callbacks for named events and broadcast typed
+//! payloads to those callbacks. Each [`PubSub<T>`] instance handles one payload
+//! type, while the crate-level macros use a global [`PubSub<String>`].
+//!
+//! # Example
+//!
+//! ```
+//! use ez_pubsub::{PubSub, SubOption};
+//! use std::sync::{Arc, Mutex};
+//!
+//! let bus = PubSub::<String>::new();
+//! let messages = Arc::new(Mutex::new(Vec::new()));
+//!
+//! let received = Arc::clone(&messages);
+//! bus.subscribe(
+//!     "user.created",
+//!     "audit-log",
+//!     "audit-service",
+//!     SubOption::Always,
+//!     move |payload| received.lock().unwrap().push(payload.clone()),
+//! );
+//!
+//! bus.broadcast("user.created", &"alice".to_string());
+//!
+//! assert_eq!(messages.lock().unwrap().as_slice(), &["alice"]);
+//! ```
+
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::borrow::Cow;
 use parking_lot::RwLock;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
+/// Controls whether a subscription runs for every broadcast or only once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubOption {
+    /// Keep the callback subscribed after each matching broadcast.
     Always,
+    /// Remove the callback after it handles the next matching broadcast.
     Once,
 }
 
+/// Shared callback function stored by the event bus.
 pub type Callback<T> = Arc<dyn Fn(&T) + Send + Sync>;
+
+/// Callback registry for a single target.
 pub type CallbackMap<T> = HashMap<Cow<'static, str>, (SubOption, Callback<T>)>;
+
+/// Target registry for a single event.
 pub type TargetMap<T> = HashMap<Cow<'static, str>, CallbackMap<T>>;
+
+/// Top-level event registry used internally by [`PubSub`].
 pub type EventMap<T> = HashMap<Cow<'static, str>, TargetMap<T>>;
 
+/// Async-friendly interface for publish-subscribe implementations.
+///
+/// The default [`PubSub`] implementation performs the same in-memory operations
+/// as the synchronous API, but exposes them through async method signatures for
+/// easier integration into async application code.
 #[async_trait]
 pub trait AsyncPubSub<T: Send + Sync + 'static>: Send + Sync {
-    async fn subscribe<E, C, I, F>(&self, event: E, callback_name: C, target_id: I, option: SubOption, callback: F) -> Result<(), PubSubError>
+    /// Subscribe a callback to an event.
+    ///
+    /// Reusing the same `event`, `target_id`, and `callback_name` replaces the
+    /// previous callback.
+    async fn subscribe<E, C, I, F>(
+        &self,
+        event: E,
+        callback_name: C,
+        target_id: I,
+        option: SubOption,
+        callback: F,
+    ) -> Result<(), PubSubError>
     where
         E: Into<Cow<'static, str>> + Send,
         C: Into<Cow<'static, str>> + Send,
         I: Into<Cow<'static, str>> + Send,
         F: Fn(&T) + Send + Sync + 'static;
 
+    /// Broadcast `data` to every callback subscribed to `event`.
     async fn broadcast(&self, event: &str, data: &T) -> Result<(), PubSubError>;
 
-    async fn unsubscribe(&self, event: &str, callback_name: Option<&str>, target_id: &str) -> Result<bool, PubSubError>;
+    /// Remove one callback for a target, or all callbacks for the target.
+    ///
+    /// Returns `true` when at least one subscription was removed.
+    async fn unsubscribe(
+        &self,
+        event: &str,
+        callback_name: Option<&str>,
+        target_id: &str,
+    ) -> Result<bool, PubSubError>;
 }
 
+/// Error type used by the async publish-subscribe trait.
 #[derive(Debug)]
 pub enum PubSubError {
+    /// A lock could not be acquired because it was poisoned.
+    ///
+    /// The current implementation uses `parking_lot`, which does not poison
+    /// locks, so this variant is reserved for compatibility with other
+    /// implementations of [`AsyncPubSub`].
     LockPoisoned,
+    /// A subscription operation failed.
     SubscriptionError(String),
+    /// A broadcast operation failed.
     BroadcastError(String),
+    /// An unsubscribe operation failed.
     UnsubscribeError(String),
 }
 
+/// Thread-safe in-memory publish-subscribe event bus.
+///
+/// A `PubSub<T>` stores callbacks for payloads of type `T`. Callback lookup is
+/// organized by event name, target id, and callback name:
+///
+/// ```text
+/// event -> target -> callback
+/// ```
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::{PubSub, SubOption};
+/// use std::sync::{Arc, Mutex};
+///
+/// let bus = PubSub::<u32>::new();
+/// let total = Arc::new(Mutex::new(0));
+///
+/// let total_for_callback = Arc::clone(&total);
+/// bus.subscribe("count", "add", "counter", SubOption::Always, move |value| {
+///     *total_for_callback.lock().unwrap() += value;
+/// });
+///
+/// bus.broadcast("count", &2);
+/// bus.broadcast("count", &3);
+///
+/// assert_eq!(*total.lock().unwrap(), 5);
+/// ```
 pub struct PubSub<T> {
     events: RwLock<EventMap<T>>,
 }
 
 impl<T> PubSub<T> {
+    /// Create an empty event bus.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::PubSub;
+    ///
+    /// let bus = PubSub::<String>::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             events: RwLock::new(HashMap::new()),
         }
     }
 
+    /// Subscribe a callback to an event.
+    ///
+    /// `event` identifies the event to listen for. `target_id` groups callbacks
+    /// by owner or component. `callback_name` identifies the callback within
+    /// that target. If the same event, target id, and callback name are used
+    /// again, the previous callback is replaced.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, SubOption};
+    ///
+    /// let bus = PubSub::<String>::new();
+    ///
+    /// bus.subscribe(
+    ///     "message.received",
+    ///     "print-message",
+    ///     "logger",
+    ///     SubOption::Always,
+    ///     |message| println!("{message}"),
+    /// );
+    /// ```
     pub fn subscribe<E, C, I, F>(
         &self,
         event: E,
@@ -63,13 +195,37 @@ impl<T> PubSub<T> {
         F: Fn(&T) + Send + Sync + 'static,
     {
         let mut events = self.events.write();
-        
+
         let targets = events.entry(event.into()).or_default();
         let callbacks = targets.entry(target_id.into()).or_default();
-        
+
         callbacks.insert(callback_name.into(), (option, Arc::new(callback)));
     }
 
+    /// Broadcast data to all callbacks subscribed to `event`.
+    ///
+    /// `SubOption::Once` callbacks are removed after they run. The internal read
+    /// lock is released before callbacks are invoked, so callbacks can safely
+    /// subscribe, unsubscribe, or broadcast through the same bus.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, SubOption};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let bus = PubSub::<String>::new();
+    /// let last = Arc::new(Mutex::new(String::new()));
+    ///
+    /// let last_message = Arc::clone(&last);
+    /// bus.subscribe("message", "remember", "state", SubOption::Always, move |message| {
+    ///     *last_message.lock().unwrap() = message.clone();
+    /// });
+    ///
+    /// bus.broadcast("message", &"hello".to_string());
+    ///
+    /// assert_eq!(last.lock().unwrap().as_str(), "hello");
+    /// ```
     pub fn broadcast(&self, event: &str, data: &T) {
         let mut callbacks_to_run = Vec::new();
         {
@@ -104,10 +260,29 @@ impl<T> PubSub<T> {
         }
     }
 
+    /// Remove subscriptions for `target_id` from `event`.
+    ///
+    /// When `callback_name` is `Some`, only that callback is removed from the
+    /// target. When `callback_name` is `None`, all callbacks for the target are
+    /// removed.
+    ///
+    /// Returns `true` if a callback or target existed and was removed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, SubOption};
+    ///
+    /// let bus = PubSub::<String>::new();
+    /// bus.subscribe("event", "callback", "target", SubOption::Always, |_| {});
+    ///
+    /// assert!(bus.unsubscribe("event", Some("callback"), "target"));
+    /// assert!(!bus.unsubscribe("event", Some("callback"), "target"));
+    /// ```
     pub fn unsubscribe(&self, event: &str, callback_name: Option<&str>, target_id: &str) -> bool {
         let mut events = self.events.write();
         let mut removed = false;
-        
+
         if let Some(targets) = events.get_mut(event) {
             if let Some(c_name) = callback_name {
                 if let Some(callbacks) = targets.get_mut(target_id) {
@@ -121,22 +296,50 @@ impl<T> PubSub<T> {
         removed
     }
 
+    /// Remove every subscription from the bus.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, SubOption};
+    ///
+    /// let bus = PubSub::<String>::new();
+    /// bus.subscribe("event", "callback", "target", SubOption::Always, |_| {});
+    ///
+    /// bus.remove_all_subscriptions();
+    ///
+    /// assert!(!bus.unsubscribe("event", Some("callback"), "target"));
+    /// ```
     pub fn remove_all_subscriptions(&self) {
         let mut events = self.events.write();
         events.clear();
     }
 }
 
+impl<T> Default for PubSub<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
-    async fn subscribe<E, C, I, F>(&self, event: E, callback_name: C, target_id: I, option: SubOption, callback: F) -> Result<(), PubSubError>
+    async fn subscribe<E, C, I, F>(
+        &self,
+        event: E,
+        callback_name: C,
+        target_id: I,
+        option: SubOption,
+        callback: F,
+    ) -> Result<(), PubSubError>
     where
         E: Into<Cow<'static, str>> + Send,
         C: Into<Cow<'static, str>> + Send,
         I: Into<Cow<'static, str>> + Send,
         F: Fn(&T) + Send + Sync + 'static,
     {
-        Ok(self.subscribe(event, callback_name, target_id, option, callback))
+        self.subscribe(event, callback_name, target_id, option, callback);
+        Ok(())
     }
 
     async fn broadcast(&self, event: &str, data: &T) -> Result<(), PubSubError> {
@@ -144,17 +347,50 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
         Ok(())
     }
 
-    async fn unsubscribe(&self, event: &str, callback_name: Option<&str>, target_id: &str) -> Result<bool, PubSubError> {
+    async fn unsubscribe(
+        &self,
+        event: &str,
+        callback_name: Option<&str>,
+        target_id: &str,
+    ) -> Result<bool, PubSubError> {
         Ok(self.unsubscribe(event, callback_name, target_id))
     }
 }
 
+/// Global string event bus used by [`broadcast!`] and [`subscribe!`].
 pub static GLOBAL_BUS: OnceLock<PubSub<String>> = OnceLock::new();
 
+/// Return the global [`PubSub<String>`] instance.
+///
+/// Prefer passing explicit [`PubSub`] instances in reusable libraries. The
+/// global bus is convenient for small applications, examples, and scripts.
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::{global_bus, SubOption};
+/// use std::sync::{Arc, Mutex};
+///
+/// global_bus().remove_all_subscriptions();
+///
+/// let received = Arc::new(Mutex::new(None));
+/// let received_message = Arc::clone(&received);
+///
+/// global_bus().subscribe("global.example", "store", "doc", SubOption::Once, move |message| {
+///     *received_message.lock().unwrap() = Some(message.clone());
+/// });
+///
+/// global_bus().broadcast("global.example", &"hello".to_string());
+///
+/// assert_eq!(received.lock().unwrap().as_deref(), Some("hello"));
+/// ```
 pub fn global_bus() -> &'static PubSub<String> {
     GLOBAL_BUS.get_or_init(PubSub::new)
 }
 
+/// Broadcast a value through the global string event bus.
+///
+/// The payload is converted with `to_string()` before being broadcast.
 #[macro_export]
 macro_rules! broadcast {
     ($event:expr, $data:expr) => {
@@ -162,13 +398,46 @@ macro_rules! broadcast {
     };
 }
 
+/// Subscribe a callback to the global string event bus.
+///
+/// # Forms
+///
+/// - `subscribe!(event, callback_name, target_id, option, closure)`
+/// - `subscribe!(event, callback_name, target_id, closure)` uses [`SubOption::Always`]
+/// - `subscribe!(event, closure)` uses a generated callback name and `file!()` as the target id
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::{broadcast, global_bus, subscribe};
+/// use std::sync::{Arc, Mutex};
+///
+/// global_bus().remove_all_subscriptions();
+///
+/// let seen = Arc::new(Mutex::new(String::new()));
+/// let seen_message = Arc::clone(&seen);
+///
+/// subscribe!("macro.example", move |message: &String| {
+///     *seen_message.lock().unwrap() = message.clone();
+/// });
+///
+/// broadcast!("macro.example", "hello");
+///
+/// assert_eq!(seen.lock().unwrap().as_str(), "hello");
+/// ```
 #[macro_export]
 macro_rules! subscribe {
     ($event:expr, $callback_name:expr, $target_id:expr, $option:expr, $closure:expr) => {
         $crate::global_bus().subscribe($event, $callback_name, $target_id, $option, $closure);
     };
     ($event:expr, $callback_name:expr, $target_id:expr, $closure:expr) => {
-        $crate::global_bus().subscribe($event, $callback_name, $target_id, $crate::SubOption::Always, $closure);
+        $crate::global_bus().subscribe(
+            $event,
+            $callback_name,
+            $target_id,
+            $crate::SubOption::Always,
+            $closure,
+        );
     };
     ($event:expr, $closure:expr) => {
         $crate::global_bus().subscribe(
@@ -176,7 +445,7 @@ macro_rules! subscribe {
             concat!("cb_", line!()),
             file!(),
             $crate::SubOption::Always,
-            $closure
+            $closure,
         );
     };
 }
@@ -192,9 +461,15 @@ mod tests {
         let counter = Arc::new(Mutex::new(0));
 
         let c1 = Arc::clone(&counter);
-        bus.subscribe("test_event", "cb1", "target1", SubOption::Always, move |_| {
-            *c1.lock().unwrap() += 1;
-        });
+        bus.subscribe(
+            "test_event",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |_| {
+                *c1.lock().unwrap() += 1;
+            },
+        );
 
         let c2 = Arc::clone(&counter);
         bus.subscribe("test_event", "cb2", "target1", SubOption::Once, move |_| {
@@ -273,9 +548,15 @@ mod tests {
         let counter = Arc::new(Mutex::new(0));
 
         let c1 = Arc::clone(&counter);
-        bus.subscribe("async_event", "cb1", "target1", SubOption::Always, move |_| {
-            *c1.lock().unwrap() += 1;
-        });
+        bus.subscribe(
+            "async_event",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |_| {
+                *c1.lock().unwrap() += 1;
+            },
+        );
 
         bus.broadcast("async_event", &"hello".to_string());
         assert_eq!(*counter.lock().unwrap(), 1);
