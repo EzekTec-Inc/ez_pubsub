@@ -53,3 +53,25 @@
 - ?? src/lib.rs.orig
 
 ---
+
+## 2026-05-22T02:45:23Z — Implemented a SkillRegistry module in ez_pubsub with TDD, utilizing the PubSub event bus.
+
+**Reason:** User requested to implement the skill registry plan. Followed TDD methodology, adding a test suite first then implementing the generic SkillRegistry module.
+
+**Files modified:**
+- M .cade-todo.md
+- M src/lib.rs
+- ?? src/skill_registry.rs
+- ?? tests/
+
+---
+
+## 2026-05-22T02:49:37Z — Reverted the skill registry implementation from `ez_pubsub`.
+
+**Reason:** The implemented skill registry code was for a different project/repository and was placed in `ez_pubsub` by mistake. Reverted working directory back to a clean state.
+
+**Files modified:**
+- M .cade-todo.md
+- M CADE_AUDIT.md
+
+---
