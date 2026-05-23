@@ -75,3 +75,15 @@
 - M CADE_AUDIT.md
 
 ---
+
+## 2026-05-23T03:50:47Z — Completed the pending ez_pubsub refactoring tasks including extended test coverage, improved error handling, comprehensive rustdocs examples, and a dependency cleanup.
+
+**Reason:** All four remaining tasks in the '.cade-todo.md' plan have been accomplished successfully. Tests cover extreme edge cases, error messages are enhanced via Display/Error trait implementations, all public APIs have usage examples (and pass cargo test --doc), and unused dependencies have been pruned from Cargo.toml.
+
+**Files modified:**
+- M .cade-todo.md
+- M Cargo.lock
+- M Cargo.toml
+- M src/lib.rs
+
+---

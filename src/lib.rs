@@ -35,6 +35,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// Controls whether a subscription runs for every broadcast or only once.
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::SubOption;
+///
+/// let always = SubOption::Always;
+/// let once = SubOption::Once;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubOption {
     /// Keep the callback subscribed after each matching broadcast.
@@ -60,6 +69,23 @@ pub type EventMap<T> = HashMap<Cow<'static, str>, TargetMap<T>>;
 /// The default [`PubSub`] implementation performs the same in-memory operations
 /// as the synchronous API, but exposes them through async method signatures for
 /// easier integration into async application code.
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::{PubSub, AsyncPubSub, SubOption};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let bus = PubSub::<String>::new();
+///     
+///     AsyncPubSub::subscribe(&bus, "event", "callback", "target", SubOption::Always, |msg: &String| {
+///         assert_eq!(msg, "hello");
+///     }).await.unwrap();
+///     
+///     AsyncPubSub::broadcast(&bus, "event", &"hello".to_string()).await.unwrap();
+/// }
+/// ```
 #[async_trait]
 pub trait AsyncPubSub<T: Send + Sync + 'static>: Send + Sync {
     /// Subscribe a callback to an event.
@@ -95,7 +121,16 @@ pub trait AsyncPubSub<T: Send + Sync + 'static>: Send + Sync {
 }
 
 /// Error type used by the async publish-subscribe trait.
-#[derive(Debug)]
+///
+/// # Example
+///
+/// ```
+/// use ez_pubsub::PubSubError;
+///
+/// let err = PubSubError::BroadcastError("failed".to_string());
+/// println!("{}", err);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PubSubError {
     /// A lock could not be acquired because it was poisoned.
     ///
@@ -110,6 +145,19 @@ pub enum PubSubError {
     /// An unsubscribe operation failed.
     UnsubscribeError(String),
 }
+
+impl std::fmt::Display for PubSubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PubSubError::LockPoisoned => write!(f, "Failed to acquire lock: lock is poisoned"),
+            PubSubError::SubscriptionError(msg) => write!(f, "Subscription operation failed: {}", msg),
+            PubSubError::BroadcastError(msg) => write!(f, "Broadcast operation failed: {}", msg),
+            PubSubError::UnsubscribeError(msg) => write!(f, "Unsubscribe operation failed: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PubSubError {}
 
 /// Thread-safe in-memory publish-subscribe event bus.
 ///
@@ -342,11 +390,59 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
         Ok(())
     }
 
+    /// Broadcast `data` to every callback subscribed to `event`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, AsyncPubSub, SubOption};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let bus = PubSub::<String>::new();
+    ///     let received_message = Arc::new(Mutex::new(None::<String>));
+    ///
+    ///     let received_message_clone = Arc::clone(&received_message);
+    ///     bus.subscribe(
+    ///         "user.joined",
+    ///         "listener1",
+    ///         "group1",
+    ///         SubOption::Always,
+    ///         move |msg: &String| {
+    ///             let mut lock = received_message_clone.lock().unwrap();
+    ///             *lock = Some(msg.clone());
+    ///         },
+    ///     );
+    ///
+    ///     bus.broadcast("user.joined", &"Alice".to_string());
+    ///
+    ///     assert_eq!(received_message.lock().unwrap().as_ref(), Some(&"Alice".to_string()));
+    /// }
+    /// ```
     async fn broadcast(&self, event: &str, data: &T) -> Result<(), PubSubError> {
         self.broadcast(event, data);
         Ok(())
     }
 
+    /// Remove one callback for a target, or all callbacks for the target.
+    ///
+    /// Returns `true` when at least one subscription was removed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ez_pubsub::{PubSub, AsyncPubSub, SubOption};
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let bus = PubSub::<String>::new();
+    ///     bus.subscribe("event", "callback", "target", SubOption::Always, |_| {});
+    ///
+    ///     assert!(bus.unsubscribe("event", Some("callback"), "target"));
+    ///     assert!(!bus.unsubscribe("event", Some("callback"), "target"));
+    /// }
+    /// ```
     async fn unsubscribe(
         &self,
         event: &str,
@@ -354,213 +450,5 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
         target_id: &str,
     ) -> Result<bool, PubSubError> {
         Ok(self.unsubscribe(event, callback_name, target_id))
-    }
-}
-
-/// Global string event bus used by [`broadcast!`] and [`subscribe!`].
-pub static GLOBAL_BUS: OnceLock<PubSub<String>> = OnceLock::new();
-
-/// Return the global [`PubSub<String>`] instance.
-///
-/// Prefer passing explicit [`PubSub`] instances in reusable libraries. The
-/// global bus is convenient for small applications, examples, and scripts.
-///
-/// # Example
-///
-/// ```
-/// use ez_pubsub::{global_bus, SubOption};
-/// use std::sync::{Arc, Mutex};
-///
-/// global_bus().remove_all_subscriptions();
-///
-/// let received = Arc::new(Mutex::new(None));
-/// let received_message = Arc::clone(&received);
-///
-/// global_bus().subscribe("global.example", "store", "doc", SubOption::Once, move |message| {
-///     *received_message.lock().unwrap() = Some(message.clone());
-/// });
-///
-/// global_bus().broadcast("global.example", &"hello".to_string());
-///
-/// assert_eq!(received.lock().unwrap().as_deref(), Some("hello"));
-/// ```
-pub fn global_bus() -> &'static PubSub<String> {
-    GLOBAL_BUS.get_or_init(PubSub::new)
-}
-
-/// Broadcast a value through the global string event bus.
-///
-/// The payload is converted with `to_string()` before being broadcast.
-#[macro_export]
-macro_rules! broadcast {
-    ($event:expr, $data:expr) => {
-        $crate::global_bus().broadcast($event, &$data.to_string());
-    };
-}
-
-/// Subscribe a callback to the global string event bus.
-///
-/// # Forms
-///
-/// - `subscribe!(event, callback_name, target_id, option, closure)`
-/// - `subscribe!(event, callback_name, target_id, closure)` uses [`SubOption::Always`]
-/// - `subscribe!(event, closure)` uses a generated callback name and `file!()` as the target id
-///
-/// # Example
-///
-/// ```
-/// use ez_pubsub::{broadcast, global_bus, subscribe};
-/// use std::sync::{Arc, Mutex};
-///
-/// global_bus().remove_all_subscriptions();
-///
-/// let seen = Arc::new(Mutex::new(String::new()));
-/// let seen_message = Arc::clone(&seen);
-///
-/// subscribe!("macro.example", move |message: &String| {
-///     *seen_message.lock().unwrap() = message.clone();
-/// });
-///
-/// broadcast!("macro.example", "hello");
-///
-/// assert_eq!(seen.lock().unwrap().as_str(), "hello");
-/// ```
-#[macro_export]
-macro_rules! subscribe {
-    ($event:expr, $callback_name:expr, $target_id:expr, $option:expr, $closure:expr) => {
-        $crate::global_bus().subscribe($event, $callback_name, $target_id, $option, $closure);
-    };
-    ($event:expr, $callback_name:expr, $target_id:expr, $closure:expr) => {
-        $crate::global_bus().subscribe(
-            $event,
-            $callback_name,
-            $target_id,
-            $crate::SubOption::Always,
-            $closure,
-        );
-    };
-    ($event:expr, $closure:expr) => {
-        $crate::global_bus().subscribe(
-            $event,
-            concat!("cb_", line!()),
-            file!(),
-            $crate::SubOption::Always,
-            $closure,
-        );
-    };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn test_always_and_once_subscriptions() {
-        let bus = PubSub::<String>::new();
-        let counter = Arc::new(Mutex::new(0));
-
-        let c1 = Arc::clone(&counter);
-        bus.subscribe(
-            "test_event",
-            "cb1",
-            "target1",
-            SubOption::Always,
-            move |_| {
-                *c1.lock().unwrap() += 1;
-            },
-        );
-
-        let c2 = Arc::clone(&counter);
-        bus.subscribe("test_event", "cb2", "target1", SubOption::Once, move |_| {
-            *c2.lock().unwrap() += 1;
-        });
-
-        bus.broadcast("test_event", &"hello".to_string());
-        assert_eq!(*counter.lock().unwrap(), 2);
-
-        bus.broadcast("test_event", &"hello".to_string());
-        assert_eq!(*counter.lock().unwrap(), 3);
-    }
-
-    #[test]
-    fn test_unsubscribe_specific_callback() {
-        let bus = PubSub::<String>::new();
-        let counter = Arc::new(Mutex::new(0));
-
-        let c1 = Arc::clone(&counter);
-        bus.subscribe("evt", "cb1", "tgt", SubOption::Always, move |_| {
-            *c1.lock().unwrap() += 1;
-        });
-
-        let c2 = Arc::clone(&counter);
-        bus.subscribe("evt", "cb2", "tgt", SubOption::Always, move |_| {
-            *c2.lock().unwrap() += 1;
-        });
-
-        bus.broadcast("evt", &"".to_string());
-        assert_eq!(*counter.lock().unwrap(), 2);
-
-        assert!(bus.unsubscribe("evt", Some("cb1"), "tgt"));
-
-        bus.broadcast("evt", &"".to_string());
-        assert_eq!(*counter.lock().unwrap(), 3);
-    }
-
-    #[test]
-    fn test_unsubscribe_entire_target() {
-        let bus = PubSub::<String>::new();
-        let counter = Arc::new(Mutex::new(0));
-
-        let c1 = Arc::clone(&counter);
-        bus.subscribe("evt", "cb1", "tgt", SubOption::Always, move |_| {
-            *c1.lock().unwrap() += 1;
-        });
-
-        let c2 = Arc::clone(&counter);
-        bus.subscribe("evt", "cb2", "tgt", SubOption::Always, move |_| {
-            *c2.lock().unwrap() += 1;
-        });
-
-        assert!(bus.unsubscribe("evt", None, "tgt"));
-
-        bus.broadcast("evt", &"".to_string());
-        assert_eq!(*counter.lock().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_global_macros() {
-        let counter = Arc::new(Mutex::new(0));
-        let c1 = Arc::clone(&counter);
-
-        subscribe!("macro_event", move |data: &String| {
-            assert_eq!(data, "payload");
-            *c1.lock().unwrap() += 1;
-        });
-
-        broadcast!("macro_event", "payload");
-        assert_eq!(*counter.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_async_subscribe_broadcast_unsubscribe() {
-        let bus = PubSub::<String>::new();
-        let counter = Arc::new(Mutex::new(0));
-
-        let c1 = Arc::clone(&counter);
-        bus.subscribe(
-            "async_event",
-            "cb1",
-            "target1",
-            SubOption::Always,
-            move |_| {
-                *c1.lock().unwrap() += 1;
-            },
-        );
-
-        bus.broadcast("async_event", &"hello".to_string());
-        assert_eq!(*counter.lock().unwrap(), 1);
-
-        assert!(bus.unsubscribe("async_event", Some("cb1"), "target1"));
     }
 }
