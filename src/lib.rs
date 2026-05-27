@@ -1,4 +1,3 @@
-
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::borrow::Cow;
@@ -15,8 +14,9 @@ pub enum SubOption {
 }
 
 /// Shared callback function stored by the event bus.
-pub type Callback<T> =
-    Arc<dyn Fn(Arc<T>) -> Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>> + Send + Sync>;
+pub type Callback<T> = Arc<
+    dyn Fn(Arc<T>) -> Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>> + Send + Sync,
+>;
 
 /// Callback registry for a single target.
 pub type CallbackMap<T> = HashMap<Cow<'static, str>, (SubOption, Callback<T>)>;
@@ -66,9 +66,13 @@ impl std::fmt::Display for PubSubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PubSubError::LockPoisoned => write!(f, "Failed to acquire lock: lock is poisoned"),
-            PubSubError::SubscriptionError(msg) => write!(f, "Subscription operation failed: {}", msg),
+            PubSubError::SubscriptionError(msg) => {
+                write!(f, "Subscription operation failed: {}", msg)
+            }
             PubSubError::BroadcastError(msg) => write!(f, "Broadcast operation failed: {}", msg),
-            PubSubError::UnsubscribeError(msg) => write!(f, "Unsubscribe operation failed: {}", msg),
+            PubSubError::UnsubscribeError(msg) => {
+                write!(f, "Unsubscribe operation failed: {}", msg)
+            }
         }
     }
 }
@@ -108,19 +112,20 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
         let mut events = self.events.write();
         let targets = events.entry(event.into()).or_default();
         let callbacks = targets.entry(target_id.into()).or_default();
-        
+
         let callback_wrapper = Arc::new(move |message: Arc<T>| {
             let fut = callback(message);
-            Box::pin(async move { fut.await }) as Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>>
+            Box::pin(fut)
+                as Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>>
         });
-        
+
         callbacks.insert(callback_name.into(), (option, callback_wrapper));
         Ok(())
     }
 
     async fn publish(&self, event: &str, data: T) -> Result<(), PubSubError> {
         let data = Arc::new(data);
-        
+
         let callbacks_to_run = {
             let events = self.events.read();
             if let Some(targets) = events.get(event) {

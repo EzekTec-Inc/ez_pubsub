@@ -1,18 +1,23 @@
+// examples/kanban_board.rs
+
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEvent},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ez_pubsub::{AsyncPubSub, PubSub, SubOption};
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction as LayoutDirection, Layout},
     style::{Color, Modifier, Style},
+    text::Span,
     widgets::{Block, Borders, List, ListItem},
-    Terminal,
 };
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
@@ -21,30 +26,26 @@ pub enum Column {
     Done,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ticket {
     pub id: u32,
     pub title: String,
     pub status: Column,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Editing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KanbanState {
     pub tickets: Vec<Ticket>,
     pub focused_ticket_id: Option<u32>,
-}
-
-impl KanbanState {
-    pub fn new() -> Self {
-        Self {
-            tickets: vec![
-                Ticket { id: 1, title: "Learn Rust".to_string(), status: Column::Done },
-                Ticket { id: 2, title: "Build Ratatui UI".to_string(), status: Column::InProgress },
-                Ticket { id: 3, title: "Integrate PubSub".to_string(), status: Column::Todo },
-            ],
-            focused_ticket_id: Some(3),
-        }
-    }
+    pub input_mode: InputMode,
+    pub input_buffer: String,
+    pub quit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,206 +54,512 @@ pub enum Direction {
     Right,
 }
 
-pub struct StateManager {}
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    UiInput(KeyEvent),
+    ActionMoveTicket(u32, Direction),
+    ActionCreateTicket(String),
+    ActionDeleteTicket(u32),
+    ActionMoveFocused(Direction),
+    ActionFocusNext,
+    ActionFocusPrevious,
+    ActionDeleteFocused,
+    ActionEnterEditMode,
+    ActionCancelEditMode,
+    ActionTypeChar(char),
+    ActionBackspace,
+    ActionSubmitEdit,
+    ActionQuit,
+    StateUpdated(KanbanState),
+}
+
+pub struct StateManager {
+    state: Arc<Mutex<KanbanState>>,
+    pubsub: Arc<PubSub<AppEvent>>,
+}
 
 impl StateManager {
-    pub async fn start(
-        state_updated_bus: Arc<PubSub<KanbanState>>,
-        action_move_ticket_bus: Arc<PubSub<(u32, Direction)>>,
-    ) {
-        use std::sync::Mutex;
-        let internal_state = Arc::new(Mutex::new(KanbanState::new()));
-        
-        let state_bus_clone = state_updated_bus.clone();
-        
-        action_move_ticket_bus.subscribe(
-            "move", 
-            "state_manager", 
-            "backend", 
-            SubOption::Always, 
-            move |action: Arc<(u32, Direction)>| {
-                let state_lock = internal_state.clone();
-                let bus = state_bus_clone.clone();
-                Box::pin(async move {
-                    let (id, dir) = *action;
-                    let new_state = {
-                        let mut state = state_lock.lock().unwrap();
-                        
-                        if let Some(ticket) = state.tickets.iter_mut().find(|t| t.id == id) {
-                            ticket.status = match (&ticket.status, dir) {
-                                (Column::Todo, Direction::Right) => Column::InProgress,
-                                (Column::InProgress, Direction::Right) => Column::Done,
-                                (Column::InProgress, Direction::Left) => Column::Todo,
-                                (Column::Done, Direction::Left) => Column::InProgress,
-                                _ => ticket.status,
-                            };
+    pub fn new(initial_state: KanbanState, pubsub: Arc<PubSub<AppEvent>>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(initial_state)),
+            pubsub,
+        }
+    }
+
+    pub async fn run(self) {
+        let state = self.state.clone();
+        let pubsub = self.pubsub.clone();
+
+        // Subscribe to actions
+        self.pubsub
+            .subscribe(
+                "action",
+                "state_manager_action_cb",
+                "state_manager",
+                SubOption::Always,
+                move |event_msg| {
+                    let state = state.clone();
+                    let pubsub = pubsub.clone();
+                    async move {
+                        match &*event_msg {
+                            AppEvent::ActionMoveTicket(id, dir) => {
+                                let mut st = state.lock().await;
+                                if let Some(ticket) = st.tickets.iter_mut().find(|t| t.id == *id) {
+                                    match (ticket.status, dir) {
+                                        (Column::Todo, Direction::Right) => {
+                                            ticket.status = Column::InProgress
+                                        }
+                                        (Column::InProgress, Direction::Right) => {
+                                            ticket.status = Column::Done
+                                        }
+                                        (Column::Done, Direction::Left) => {
+                                            ticket.status = Column::InProgress
+                                        }
+                                        (Column::InProgress, Direction::Left) => {
+                                            ticket.status = Column::Todo
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionCreateTicket(title) => {
+                                let mut st = state.lock().await;
+                                let new_id = st.tickets.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                                st.tickets.push(Ticket {
+                                    id: new_id,
+                                    title: title.clone(),
+                                    status: Column::Todo,
+                                });
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionDeleteTicket(id) => {
+                                let mut st = state.lock().await;
+                                st.tickets.retain(|t| t.id != *id);
+                                if st.focused_ticket_id == Some(*id) {
+                                    st.focused_ticket_id = st.tickets.first().map(|t| t.id);
+                                }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionMoveFocused(dir) => {
+                                let mut st = state.lock().await;
+                                if let Some(focused_id) = st.focused_ticket_id
+                                    && let Some(ticket) =
+                                        st.tickets.iter_mut().find(|t| t.id == focused_id)
+                                    {
+                                        match (ticket.status, dir) {
+                                            (Column::Todo, Direction::Right) => {
+                                                ticket.status = Column::InProgress
+                                            }
+                                            (Column::InProgress, Direction::Right) => {
+                                                ticket.status = Column::Done
+                                            }
+                                            (Column::Done, Direction::Left) => {
+                                                ticket.status = Column::InProgress
+                                            }
+                                            (Column::InProgress, Direction::Left) => {
+                                                ticket.status = Column::Todo
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionFocusNext => {
+                                let mut st = state.lock().await;
+                                if !st.tickets.is_empty() {
+                                    let curr_idx = st
+                                        .tickets
+                                        .iter()
+                                        .position(|t| Some(t.id) == st.focused_ticket_id)
+                                        .unwrap_or(0);
+                                    let next_idx = (curr_idx + 1) % st.tickets.len();
+                                    st.focused_ticket_id = Some(st.tickets[next_idx].id);
+                                }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionFocusPrevious => {
+                                let mut st = state.lock().await;
+                                if !st.tickets.is_empty() {
+                                    let curr_idx = st
+                                        .tickets
+                                        .iter()
+                                        .position(|t| Some(t.id) == st.focused_ticket_id)
+                                        .unwrap_or(0);
+                                    let next_idx = if curr_idx == 0 {
+                                        st.tickets.len() - 1
+                                    } else {
+                                        curr_idx - 1
+                                    };
+                                    st.focused_ticket_id = Some(st.tickets[next_idx].id);
+                                }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionDeleteFocused => {
+                                let mut st = state.lock().await;
+                                if let Some(focused_id) = st.focused_ticket_id {
+                                    st.tickets.retain(|t| t.id != focused_id);
+                                    st.focused_ticket_id = st.tickets.first().map(|t| t.id);
+                                }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionEnterEditMode => {
+                                let mut st = state.lock().await;
+                                if let Some(focused_id) = st.focused_ticket_id
+                                    && let Some(ticket) =
+                                        st.tickets.iter().find(|t| t.id == focused_id)
+                                    {
+                                        st.input_buffer = ticket.title.clone();
+                                        st.input_mode = InputMode::Editing;
+                                    }
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionCancelEditMode => {
+                                let mut st = state.lock().await;
+                                st.input_mode = InputMode::Normal;
+                                st.input_buffer.clear();
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            AppEvent::ActionSubmitEdit => {
+                                let mut st = state.lock().await;
+                                if st.input_mode == InputMode::Editing {
+                                    let new_title = st.input_buffer.clone();
+                                    if let Some(focused_id) = st.focused_ticket_id
+                                        && let Some(ticket) =
+                                            st.tickets.iter_mut().find(|t| t.id == focused_id)
+                                        {
+                                            ticket.title = new_title;
+                                        }
+                                    st.input_mode = InputMode::Normal;
+                                    st.input_buffer.clear();
+                                    let cloned_state = st.clone();
+                                    let _ = pubsub
+                                        .publish(
+                                            "state_update",
+                                            AppEvent::StateUpdated(cloned_state),
+                                        )
+                                        .await;
+                                }
+                            }
+                            AppEvent::ActionTypeChar(c) => {
+                                let mut st = state.lock().await;
+                                if st.input_mode == InputMode::Editing {
+                                    st.input_buffer.push(*c);
+                                    let cloned_state = st.clone();
+                                    let _ = pubsub
+                                        .publish(
+                                            "state_update",
+                                            AppEvent::StateUpdated(cloned_state),
+                                        )
+                                        .await;
+                                }
+                            }
+                            AppEvent::ActionBackspace => {
+                                let mut st = state.lock().await;
+                                if st.input_mode == InputMode::Editing {
+                                    st.input_buffer.pop();
+                                    let cloned_state = st.clone();
+                                    let _ = pubsub
+                                        .publish(
+                                            "state_update",
+                                            AppEvent::StateUpdated(cloned_state),
+                                        )
+                                        .await;
+                                }
+                            }
+                            AppEvent::ActionQuit => {
+                                let mut st = state.lock().await;
+                                st.quit = true;
+                                let cloned_state = st.clone();
+                                let _ = pubsub
+                                    .publish("state_update", AppEvent::StateUpdated(cloned_state))
+                                    .await;
+                            }
+                            _ => {}
                         }
-                        
-                        state.clone()
-                    };
-                    
-                    let _ = bus.publish("state_updates", new_state).await;
-                    Ok(())
-                })
-            }
-        ).await.unwrap();
-        
-        // Push the initial state so UI can render immediately
-        let _ = state_updated_bus.publish("state_updates", KanbanState::new()).await;
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .expect("Failed to subscribe");
     }
 }
 
-pub struct App {
-    pub state: std::sync::Mutex<KanbanState>,
-    pub should_quit: std::sync::atomic::AtomicBool,
+pub struct KanbanApp {
+    pub state: Arc<Mutex<KanbanState>>,
+    pub pubsub: Arc<PubSub<AppEvent>>,
 }
 
-impl App {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: std::sync::Mutex::new(KanbanState::new()),
-            should_quit: std::sync::atomic::AtomicBool::new(false),
-        })
+impl KanbanApp {
+    pub fn new(initial_state: KanbanState, pubsub: Arc<PubSub<AppEvent>>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(initial_state)),
+            pubsub,
+        }
     }
 
-    pub async fn subscribe_to_state_updates(self: &Arc<Self>, state_updated_bus: Arc<PubSub<KanbanState>>) {
-        let app_clone = self.clone();
-        state_updated_bus.subscribe(
-            "state_updates",
-            "ui_state_updater",
-            "ui",
-            SubOption::Always,
-            move |new_state: Arc<KanbanState>| {
-                let app = app_clone.clone();
-                Box::pin(async move {
-                    *app.state.lock().unwrap() = (*new_state).clone();
-                    Ok(())
-                })
+    pub async fn run_headless(&self) {
+        let state = self.state.clone();
+
+        self.pubsub
+            .subscribe(
+                "state_update",
+                "ui_state_cb",
+                "ui",
+                SubOption::Always,
+                move |event_msg| {
+                    let state = state.clone();
+                    async move {
+                        if let AppEvent::StateUpdated(new_state) = &*event_msg {
+                            *state.lock().await = new_state.clone();
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .expect("Failed to subscribe UI");
+    }
+
+    pub async fn run_ui(&self) -> io::Result<()> {
+        self.run_headless().await;
+
+        io::stdout().execute(EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend)?;
+
+        loop {
+            // Check if we need to quit (assuming 'q' triggers UI exit)
+            // The keyboard dispatcher will be implemented in US3.
+            // For now, we will draw the state.
+            let current_state = self.state.lock().await.clone();
+
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(LayoutDirection::Horizontal)
+                    .constraints(
+                        [
+                            Constraint::Percentage(33),
+                            Constraint::Percentage(33),
+                            Constraint::Percentage(33),
+                        ]
+                        .as_ref(),
+                    )
+                    .split(f.area());
+
+                let mut todo_items = vec![];
+                let mut in_progress_items = vec![];
+                let mut done_items = vec![];
+
+                for ticket in &current_state.tickets {
+                    let mut style = Style::default();
+                    let is_focused = current_state.focused_ticket_id == Some(ticket.id);
+                    if is_focused {
+                        style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    }
+
+                    let display_title =
+                        if is_focused && current_state.input_mode == InputMode::Editing {
+                            format!("{}█", current_state.input_buffer)
+                        } else {
+                            ticket.title.clone()
+                        };
+
+                    let span = Span::styled(format!("[{}] {}", ticket.id, display_title), style);
+                    match ticket.status {
+                        Column::Todo => todo_items.push(ListItem::new(span)),
+                        Column::InProgress => in_progress_items.push(ListItem::new(span)),
+                        Column::Done => done_items.push(ListItem::new(span)),
+                    }
+                }
+
+                let todo_list = List::new(todo_items)
+                    .block(Block::default().title("TODO").borders(Borders::ALL));
+                let in_progress_list = List::new(in_progress_items)
+                    .block(Block::default().title("IN PROGRESS").borders(Borders::ALL));
+                let done_list = List::new(done_items)
+                    .block(Block::default().title("DONE").borders(Borders::ALL));
+
+                f.render_widget(todo_list, chunks[0]);
+                f.render_widget(in_progress_list, chunks[1]);
+                f.render_widget(done_list, chunks[2]);
+            })?;
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+
+            if current_state.quit {
+                break;
             }
-        ).await.unwrap();
-    }
+        }
 
-    pub fn render(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-        let state = self.state.lock().unwrap().clone();
-        
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(LayoutDirection::Horizontal)
-                .constraints([
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                ])
-                .split(f.area());
-
-            let todo_tickets: Vec<ListItem> = state.tickets.iter().filter(|t| t.status == Column::Todo).map(|t| {
-                let mut style = Style::default();
-                if state.focused_ticket_id == Some(t.id) {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-                ListItem::new(format!("[{}] {}", t.id, t.title)).style(style)
-            }).collect();
-            let todo_list = List::new(todo_tickets).block(Block::default().borders(Borders::ALL).title("TODO"));
-            f.render_widget(todo_list, chunks[0]);
-
-            let inprogress_tickets: Vec<ListItem> = state.tickets.iter().filter(|t| t.status == Column::InProgress).map(|t| {
-                let mut style = Style::default();
-                if state.focused_ticket_id == Some(t.id) {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-                ListItem::new(format!("[{}] {}", t.id, t.title)).style(style)
-            }).collect();
-            let inprogress_list = List::new(inprogress_tickets).block(Block::default().borders(Borders::ALL).title("IN PROGRESS"));
-            f.render_widget(inprogress_list, chunks[1]);
-
-            let done_tickets: Vec<ListItem> = state.tickets.iter().filter(|t| t.status == Column::Done).map(|t| {
-                let mut style = Style::default();
-                if state.focused_ticket_id == Some(t.id) {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-                ListItem::new(format!("[{}] {}", t.id, t.title)).style(style)
-            }).collect();
-            let done_list = List::new(done_tickets).block(Block::default().borders(Borders::ALL).title("DONE"));
-            f.render_widget(done_list, chunks[2]);
-        })?;
+        disable_raw_mode()?;
+        io::stdout().execute(LeaveAlternateScreen)?;
         Ok(())
     }
 }
 
-pub fn spawn_keyboard_loop(
-    ui_input_bus: Arc<PubSub<KeyEvent>>,
-    action_move_ticket_bus: Arc<PubSub<(u32, Direction)>>,
-    app: Arc<App>,
-) {
-    tokio::task::spawn_blocking(move || {
-        loop {
-            if app.should_quit.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            if event::poll(std::time::Duration::from_millis(50)).unwrap() {
-                if let Event::Key(key) = event::read().unwrap() {
-                    if key.kind == KeyEventKind::Press {
-                        let bus_clone = ui_input_bus.clone();
-                        futures::executor::block_on(async {
-                            let _ = bus_clone.publish("key", key).await;
-                        });
+pub struct KeyboardDispatcher {
+    pubsub: Arc<PubSub<AppEvent>>,
+    state: Arc<Mutex<KanbanState>>,
+}
 
-                        if key.code == KeyCode::Char('q') {
-                            app.should_quit.store(true, std::sync::atomic::Ordering::Relaxed);
-                        } else if key.code == KeyCode::Right || key.code == KeyCode::Left {
-                            let dir = if key.code == KeyCode::Right { Direction::Right } else { Direction::Left };
-                            let focused_id = { app.state.lock().unwrap().focused_ticket_id };
-                            if let Some(id) = focused_id {
-                                let action_bus = action_move_ticket_bus.clone();
-                                futures::executor::block_on(async {
-                                    let _ = action_bus.publish("move", (id, dir)).await;
-                                });
+impl KeyboardDispatcher {
+    pub fn new(pubsub: Arc<PubSub<AppEvent>>, state: Arc<Mutex<KanbanState>>) -> Self {
+        Self { pubsub, state }
+    }
+
+    pub async fn run(self) {
+        let pubsub = self.pubsub.clone();
+        let state = self.state.clone();
+
+        let _ = tokio::task::spawn_blocking(move || {
+            loop {
+                if let Ok(Event::Key(key)) = event::read() {
+                    let pubsub = pubsub.clone();
+                    let state = state.clone();
+
+                    tokio::spawn(async move {
+                        let _ = pubsub.publish("ui_input", AppEvent::UiInput(key)).await;
+
+                        let is_editing = state.lock().await.input_mode == InputMode::Editing;
+                        if is_editing {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let _ =
+                                        pubsub.publish("action", AppEvent::ActionSubmitEdit).await;
+                                }
+                                KeyCode::Esc => {
+                                    let _ = pubsub
+                                        .publish("action", AppEvent::ActionCancelEditMode)
+                                        .await;
+                                }
+                                KeyCode::Backspace => {
+                                    let _ =
+                                        pubsub.publish("action", AppEvent::ActionBackspace).await;
+                                }
+                                KeyCode::Char(c) => {
+                                    let _ =
+                                        pubsub.publish("action", AppEvent::ActionTypeChar(c)).await;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    let _ = pubsub
+                                        .publish(
+                                            "action",
+                                            AppEvent::ActionMoveFocused(Direction::Right),
+                                        )
+                                        .await;
+                                }
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    let _ = pubsub
+                                        .publish(
+                                            "action",
+                                            AppEvent::ActionMoveFocused(Direction::Left),
+                                        )
+                                        .await;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let _ =
+                                        pubsub.publish("action", AppEvent::ActionFocusNext).await;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let _ = pubsub
+                                        .publish("action", AppEvent::ActionFocusPrevious)
+                                        .await;
+                                }
+                                KeyCode::Char('a') => {
+                                    let _ = pubsub
+                                        .publish(
+                                            "action",
+                                            AppEvent::ActionCreateTicket("New Task".into()),
+                                        )
+                                        .await;
+                                }
+                                KeyCode::Char('e') | KeyCode::Enter => {
+                                    let _ = pubsub
+                                        .publish("action", AppEvent::ActionEnterEditMode)
+                                        .await;
+                                }
+                                KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                                    let _ = pubsub
+                                        .publish("action", AppEvent::ActionDeleteFocused)
+                                        .await;
+                                }
+                                KeyCode::Char('q') => {
+                                    let _ = pubsub.publish("action", AppEvent::ActionQuit).await;
+                                }
+                                _ => {}
                             }
                         }
-                    }
+                    });
                 }
             }
-        }
-    });
+        })
+        .await;
+    }
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let ui_input_bus: Arc<PubSub<KeyEvent>> = Arc::new(PubSub::new());
-    let action_move_ticket_bus: Arc<PubSub<(u32, Direction)>> = Arc::new(PubSub::new());
-    let state_updated_bus: Arc<PubSub<KanbanState>> = Arc::new(PubSub::new());
+    let pubsub = Arc::new(PubSub::<AppEvent>::new());
 
-    let app = App::new();
-    app.subscribe_to_state_updates(state_updated_bus.clone()).await;
+    let initial_state = KanbanState {
+        tickets: vec![Ticket {
+            id: 1,
+            title: "Task 1".into(),
+            status: Column::Todo,
+        }],
+        focused_ticket_id: Some(1),
+        input_mode: InputMode::Normal,
+        input_buffer: String::new(),
+        quit: false,
+    };
 
-    // Start background state manager
-    let s_bus = state_updated_bus.clone();
-    let a_bus = action_move_ticket_bus.clone();
+    let state_manager = StateManager::new(initial_state.clone(), pubsub.clone());
     tokio::spawn(async move {
-        StateManager::start(s_bus, a_bus).await;
+        state_manager.run().await;
     });
 
-    spawn_keyboard_loop(ui_input_bus.clone(), action_move_ticket_bus.clone(), app.clone());
+    let dispatcher =
+        KeyboardDispatcher::new(pubsub.clone(), Arc::new(Mutex::new(initial_state.clone())));
+    tokio::spawn(async move {
+        dispatcher.run().await;
+    });
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-    // Render loop
-    loop {
-        app.render(&mut terminal)?;
-        if app.should_quit.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(16)).await; // ~60fps
-    }
-
-    // Teardown terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let app = KanbanApp::new(initial_state, pubsub.clone());
+    app.run_ui().await?;
 
     Ok(())
 }
@@ -260,111 +567,156 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::time::sleep;
+    use tokio::sync::Mutex;
 
     #[tokio::test]
-    async fn test_state_manager_moves_ticket_and_publishes_update() {
-        let action_move_ticket_bus: Arc<PubSub<(u32, Direction)>> = Arc::new(PubSub::new());
-        let state_updated_bus: Arc<PubSub<KanbanState>> = Arc::new(PubSub::new());
+    async fn test_state_manager_moves_ticket() {
+        let pubsub = PubSub::<AppEvent>::new();
+        let pubsub = Arc::new(pubsub);
 
-        let received_state = Arc::new(Mutex::new(None));
-        let rx_state = received_state.clone();
+        let initial_state = KanbanState {
+            tickets: vec![Ticket {
+                id: 1,
+                title: "Task 1".into(),
+                status: Column::Todo,
+            }],
+            focused_ticket_id: Some(1),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            quit: false,
+        };
 
-        state_updated_bus.subscribe("state_updates", "test_listener", "tests", SubOption::Always, move |state: Arc<KanbanState>| {
-            let state_lock = rx_state.clone();
-            Box::pin(async move {
-                *state_lock.lock().unwrap() = Some((*state).clone());
-                Ok(())
-            })
-        }).await.unwrap();
-
-        // Start manager
-        let state_bus_clone = state_updated_bus.clone();
-        let action_bus_clone = action_move_ticket_bus.clone();
+        let state_manager = StateManager::new(initial_state, pubsub.clone());
         tokio::spawn(async move {
-            StateManager::start(state_bus_clone, action_bus_clone).await;
+            state_manager.run().await;
         });
 
-        // Give it a moment to boot up and subscribe
-        sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Move ticket 3 (Todo -> InProgress)
-        action_move_ticket_bus.publish("move", (3, Direction::Right)).await.unwrap();
+        let state_received = Arc::new(Mutex::new(None));
+        let state_rx = state_received.clone();
 
-        // Give manager a moment to process and publish back
-        sleep(Duration::from_millis(50)).await;
+        pubsub
+            .subscribe(
+                "state_update",
+                "test_cb",
+                "test_target",
+                SubOption::Always,
+                move |msg| {
+                    let state_rx = state_rx.clone();
+                    async move {
+                        if let AppEvent::StateUpdated(st) = &*msg {
+                            *state_rx.lock().await = Some(st.clone());
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
 
-        let state = received_state.lock().unwrap().clone().expect("State manager should have broadcasted the updated state");
-        
-        let ticket_3 = state.tickets.iter().find(|t| t.id == 3).unwrap();
-        assert_eq!(ticket_3.status, Column::InProgress, "Ticket 3 should have moved to InProgress");
+        // Publish action
+        pubsub
+            .publish("action", AppEvent::ActionMoveTicket(1, Direction::Right))
+            .await
+            .unwrap();
+
+        // Await updated state
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let st = state_received
+            .lock()
+            .await
+            .take()
+            .expect("Did not receive StateUpdated");
+        let ticket = st.tickets.iter().find(|t| t.id == 1).unwrap();
+        assert_eq!(ticket.status, Column::InProgress);
     }
 
     #[tokio::test]
-    async fn test_app_updates_state_on_broadcast() {
-        let state_updated_bus: Arc<PubSub<KanbanState>> = Arc::new(PubSub::new());
-        let app = App::new();
+    async fn test_ui_struct_updates_on_state_updated() {
+        let pubsub = Arc::new(PubSub::<AppEvent>::new());
+        let initial_state = KanbanState {
+            tickets: vec![],
+            focused_ticket_id: None,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            quit: false,
+        };
 
-        app.subscribe_to_state_updates(state_updated_bus.clone()).await;
+        let app = KanbanApp::new(initial_state, pubsub.clone());
+        app.run_headless().await;
 
-        let mut test_state = KanbanState::new();
-        test_state.tickets.clear(); // Empty it for a distinct test state
-        test_state.tickets.push(Ticket { id: 99, title: "Test Ticket".to_string(), status: Column::Todo });
-        
-        state_updated_bus.publish("state_updates", test_state).await.unwrap();
-        
-        sleep(Duration::from_millis(10)).await;
+        let new_state = KanbanState {
+            tickets: vec![Ticket {
+                id: 2,
+                title: "Task 2".into(),
+                status: Column::Done,
+            }],
+            focused_ticket_id: Some(2),
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            quit: false,
+        };
+        pubsub
+            .publish("state_update", AppEvent::StateUpdated(new_state.clone()))
+            .await
+            .unwrap();
 
-        let app_state = app.state.lock().unwrap();
-        assert_eq!(app_state.tickets.len(), 1, "App state should have been updated");
-        assert_eq!(app_state.tickets[0].id, 99, "App state should have the new ticket");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let st = app.state.lock().await;
+        assert_eq!(st.tickets.len(), 1);
+        assert_eq!(st.tickets[0].id, 2);
     }
 
     #[tokio::test]
-    async fn test_keyboard_input_dispatch() {
-        let ui_input_bus: Arc<PubSub<KeyEvent>> = Arc::new(PubSub::new());
-        let action_move_ticket_bus: Arc<PubSub<(u32, Direction)>> = Arc::new(PubSub::new());
-        let app = App::new();
+    async fn test_keyboard_dispatcher_broadcasts_events() {
+        let pubsub = Arc::new(PubSub::<AppEvent>::new());
+        let initial_state = KanbanState {
+            tickets: vec![],
+            focused_ticket_id: None,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            quit: false,
+        };
+        let _dispatcher =
+            KeyboardDispatcher::new(pubsub.clone(), Arc::new(Mutex::new(initial_state)));
 
-        let received_actions = Arc::new(Mutex::new(vec![]));
-        let rx_actions = received_actions.clone();
+        let received = Arc::new(Mutex::new(false));
+        let rx = received.clone();
 
-        action_move_ticket_bus.subscribe("move", "test_listener", "tests", SubOption::Always, move |action: Arc<(u32, Direction)>| {
-            let actions_lock = rx_actions.clone();
-            Box::pin(async move {
-                actions_lock.lock().unwrap().push((*action).clone());
-                Ok(())
-            })
-        }).await.unwrap();
+        pubsub
+            .subscribe(
+                "action",
+                "kb_test_cb",
+                "kb_test",
+                SubOption::Always,
+                move |event_msg| {
+                    let rx = rx.clone();
+                    async move {
+                        if let AppEvent::ActionCreateTicket(title) = &*event_msg {
+                            if title == "New Task" {
+                                *rx.lock().await = true;
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
 
-        // We can't easily mock crossterm::event::read in the blocking loop,
-        // but we can manually verify the mapping logic inside the loop if we extracted it,
-        // or just accept that the loop implementation calls publish correctly.
-        // For the sake of the TDD test (T012), let's just trigger the ui_input_bus directly 
-        // to simulate a key press if we were handling keys via pubsub, 
-        // or ensure our `ui_input_bus` publishes the key event.
-        
-        let received_keys = Arc::new(Mutex::new(vec![]));
-        let rx_keys = received_keys.clone();
-        
-        ui_input_bus.subscribe("key", "test_listener", "tests", SubOption::Always, move |key: Arc<KeyEvent>| {
-            let keys_lock = rx_keys.clone();
-            Box::pin(async move {
-                keys_lock.lock().unwrap().push((*key).clone());
-                Ok(())
-            })
-        }).await.unwrap();
+        pubsub
+            .publish("action", AppEvent::ActionCreateTicket("New Task".into()))
+            .await
+            .unwrap();
 
-        // Simulate pressing 'q' by publishing directly
-        let key_q = KeyEvent::new(KeyCode::Char('q'), crossterm::event::KeyModifiers::NONE);
-        ui_input_bus.publish("key", key_q).await.unwrap();
-        
-        sleep(Duration::from_millis(10)).await;
-        
-        let keys = received_keys.lock().unwrap();
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].code, KeyCode::Char('q'));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let got = *received.lock().await;
+        assert!(got, "Did not receive ActionCreateTicket event");
     }
 }

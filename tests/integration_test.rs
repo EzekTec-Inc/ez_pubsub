@@ -1,4 +1,3 @@
-
 use ez_pubsub::{AsyncPubSub, PubSub, SubOption};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,13 +10,19 @@ async fn test_single_publisher_single_subscriber() {
 
     let messages_clone = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "cb1", "target1", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
@@ -40,25 +45,37 @@ async fn test_single_publisher_multiple_subscribers() {
 
     let messages_clone1 = received_messages1.clone();
     pubsub
-        .subscribe("test_topic", "cb1", "target1", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone1.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone1.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
     let messages_clone2 = received_messages2.clone();
     pubsub
-        .subscribe("test_topic", "cb2", "target2", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone2.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb2",
+            "target2",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone2.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
@@ -84,13 +101,19 @@ async fn test_multiple_publishers_single_subscriber() {
 
     let messages_clone = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "cb1", "target1", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
@@ -127,39 +150,58 @@ async fn test_concurrent_callbacks_do_not_block() {
 
     let messages_clone1 = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "slow_cb", "target1", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone1.clone();
-            Box::pin(async move {
-                sleep(Duration::from_millis(100)).await;
-                messages.lock().unwrap().push(format!("slow: {}", *message));
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "slow_cb",
+            "target1",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone1.clone();
+                Box::pin(async move {
+                    sleep(Duration::from_millis(100)).await;
+                    messages.lock().unwrap().push(format!("slow: {}", *message));
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
     let messages_clone2 = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "fast_cb", "target2", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone2.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push(format!("fast: {}", *message));
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "fast_cb",
+            "target2",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone2.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push(format!("fast: {}", *message));
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
     let pubsub_clone = pubsub.clone();
     tokio::spawn(async move {
-        pubsub_clone.publish("test_topic", "hello".to_string()).await.unwrap();
+        pubsub_clone
+            .publish("test_topic", "hello".to_string())
+            .await
+            .unwrap();
     });
 
     sleep(Duration::from_millis(20)).await;
-    
+
     {
         let messages = received_messages.lock().unwrap();
-        assert_eq!(messages.len(), 1, "Fast callback was blocked by the slow callback!");
+        assert_eq!(
+            messages.len(),
+            1,
+            "Fast callback was blocked by the slow callback!"
+        );
         assert_eq!(messages[0], "fast: hello");
     }
 
@@ -178,13 +220,19 @@ async fn test_unsubscribe() {
 
     let messages_clone = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "cb1", "target1", SubOption::Always, move |message: Arc<String>| {
-            let messages = messages_clone.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb1",
+            "target1",
+            SubOption::Always,
+            move |message: Arc<String>| {
+                let messages = messages_clone.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
@@ -194,7 +242,10 @@ async fn test_unsubscribe() {
         .unwrap();
     sleep(Duration::from_millis(10)).await;
 
-    pubsub.unsubscribe("test_topic", Some("cb1"), "target1").await.unwrap();
+    pubsub
+        .unsubscribe("test_topic", Some("cb1"), "target1")
+        .await
+        .unwrap();
 
     pubsub
         .publish("test_topic", "hello 2".to_string())
@@ -203,7 +254,7 @@ async fn test_unsubscribe() {
     sleep(Duration::from_millis(10)).await;
 
     let messages = received_messages.lock().unwrap();
-    assert_eq!(messages.len(), 1); 
+    assert_eq!(messages.len(), 1);
     assert_eq!(messages[0], "hello 1");
 }
 
@@ -214,13 +265,19 @@ async fn test_sub_option_once() {
 
     let messages_clone = received_messages.clone();
     pubsub
-        .subscribe("test_topic", "cb1", "target1", SubOption::Once, move |message: Arc<String>| {
-            let messages = messages_clone.clone();
-            Box::pin(async move {
-                messages.lock().unwrap().push((*message).clone());
-                Ok(())
-            })
-        })
+        .subscribe(
+            "test_topic",
+            "cb1",
+            "target1",
+            SubOption::Once,
+            move |message: Arc<String>| {
+                let messages = messages_clone.clone();
+                Box::pin(async move {
+                    messages.lock().unwrap().push((*message).clone());
+                    Ok(())
+                })
+            },
+        )
         .await
         .unwrap();
 
