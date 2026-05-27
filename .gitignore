@@ -6,3 +6,6 @@
 .specify/
 node_modules/
 .cade-todo.md
+.env*
+*.rs.bk
+*.log
