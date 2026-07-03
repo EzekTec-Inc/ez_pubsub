@@ -127,6 +127,54 @@ Callbacks receive `&T` and are invoked synchronously when `broadcast` is called.
 
 `AsyncPubSub` wraps the same operations in async method signatures. The callbacks themselves are currently synchronous closures. If you need truly async callback bodies, spawn work from inside the callback or wrap this crate behind your own async task/channel boundary.
 
+## Architecture & Mechanics
+
+### 1. Subscription & Callback Hierarchy
+Subscribers register to events with a hierarchical namespace structure: `Event` ──► `Target` ──► `Callback Name`. This three-tiered organization allows complex components to easily register multiple distinct callbacks for the same event and teardown subscriptions granularly:
+
+```text
+  PubSub Event Bus
+         │
+         └── Events Map (RwLock<HashMap<Cow, TargetMap>>)
+               │
+               ├── "state_update" ──► TargetMap (HashMap<Cow, CallbackMap>)
+               │                        │
+               │                        └── "ui" ──► CallbackMap (HashMap<Cow, (SubOption, Callback)>)
+               │                                       │
+               │                                       ├── "ui_state_cb" ────► (Always, CallbackFn)
+               │                                       └── "cleanup_alert" ──► (Once, CallbackFn)
+               │
+               └── "ui_input" ─────► ...
+```
+
+---
+
+### 2. Publication & Message Dispatch Flow
+`ez_pubsub` is designed for high concurrency and avoids deadlocks by releasing locks *before* executing async callbacks. Crucially, it manages one-shot (`SubOption::Once`) callbacks atomically in a race-free manner:
+
+```text
+                   [publish(event, data)]
+                              │
+                              ▼
+                  Acquire RWLock Read Lock
+                 Are there any "Once" subs?
+                   /                    \
+                (Yes)                   (No)
+                 /                        \
+         Drop Read Lock              Keep Read Lock
+        Acquire Write Lock          Clone "Always" Callbacks
+      Atomically Extract "Once"         (cheap Arc copies)
+        and Keep "Always"                 │
+        Release Write Lock          Release Read Lock
+                │                         │
+                ▼                         ▼
+            ┌─────────────────────────────────┐
+            │ Combine Callback Futures into a │
+            │   Vec<Future> and await them    │
+            │   concurrently via join_all()   │
+            └─────────────────────────────────┘
+```
+
 ## Development
 
 Run the test suite:
