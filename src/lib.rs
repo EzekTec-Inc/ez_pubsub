@@ -56,7 +56,6 @@ pub trait AsyncPubSub<T: Send + Sync + 'static>: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PubSubError {
-    LockPoisoned,
     SubscriptionError(String),
     BroadcastError(String),
     UnsubscribeError(String),
@@ -65,7 +64,6 @@ pub enum PubSubError {
 impl std::fmt::Display for PubSubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PubSubError::LockPoisoned => write!(f, "Failed to acquire lock: lock is poisoned"),
             PubSubError::SubscriptionError(msg) => {
                 write!(f, "Subscription operation failed: {}", msg)
             }
@@ -115,8 +113,7 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
 
         let callback_wrapper = Arc::new(move |message: Arc<T>| {
             let fut = callback(message);
-            Box::pin(fut)
-                as Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>>
+            Box::pin(fut) as Pin<Box<dyn Future<Output = Result<(), PubSubError>> + Send>>
         });
 
         callbacks.insert(callback_name.into(), (option, callback_wrapper));
@@ -126,24 +123,65 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
     async fn publish(&self, event: &str, data: T) -> Result<(), PubSubError> {
         let data = Arc::new(data);
 
-        let callbacks_to_run = {
+        // Check if there are any Once callbacks under a read lock first.
+        let has_once_initially = {
             let events = self.events.read();
             if let Some(targets) = events.get(event) {
                 targets
                     .values()
                     .flat_map(|callbacks| callbacks.values())
-                    .map(|(opt, cb)| (*opt, Arc::clone(cb)))
+                    .any(|(opt, _)| *opt == SubOption::Once)
+            } else {
+                return Ok(());
+            }
+        };
+
+        let callbacks_to_run = if has_once_initially {
+            // Acquire a write lock to atomically extract SubOption::Once callbacks.
+            let mut events = self.events.write();
+            let run_list = if let Some(targets) = events.get_mut(event) {
+                let mut run_list = Vec::new();
+                for callbacks in targets.values_mut() {
+                    let mut once_callbacks = Vec::new();
+                    callbacks.retain(|_, (opt, cb)| {
+                        if *opt == SubOption::Once {
+                            once_callbacks.push(Arc::clone(cb));
+                            false // remove Once subscriptions
+                        } else {
+                            run_list.push(Arc::clone(cb));
+                            true // keep Always subscriptions
+                        }
+                    });
+                    for cb in once_callbacks {
+                        run_list.push(cb);
+                    }
+                }
+                targets.retain(|_, callbacks| !callbacks.is_empty());
+                run_list
+            } else {
+                return Ok(());
+            };
+
+            // Clean up the event if all its targets are empty.
+            if events.get(event).is_some_and(|targets| targets.is_empty()) {
+                events.remove(event);
+            }
+            run_list
+        } else {
+            // Only Always callbacks exist, use read lock.
+            let events = self.events.read();
+            if let Some(targets) = events.get(event) {
+                targets
+                    .values()
+                    .flat_map(|callbacks| callbacks.values())
+                    .map(|(_, cb)| Arc::clone(cb))
                     .collect::<Vec<_>>()
             } else {
                 return Ok(());
             }
         };
 
-        let mut has_once = false;
-        let futures = callbacks_to_run.into_iter().map(|(opt, cb)| {
-            if opt == SubOption::Once {
-                has_once = true;
-            }
+        let futures = callbacks_to_run.into_iter().map(|cb| {
             let data_clone = data.clone();
             async move {
                 if let Err(e) = cb(data_clone).await {
@@ -153,16 +191,6 @@ impl<T: Send + Sync + 'static> AsyncPubSub<T> for PubSub<T> {
         });
 
         futures::future::join_all(futures).await;
-
-        if has_once {
-            let mut events = self.events.write();
-            if let Some(targets) = events.get_mut(event) {
-                for callbacks in targets.values_mut() {
-                    callbacks.retain(|_, (opt, _)| *opt == SubOption::Always);
-                }
-                targets.retain(|_, callbacks| !callbacks.is_empty());
-            }
-        }
 
         Ok(())
     }

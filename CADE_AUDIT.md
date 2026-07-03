@@ -137,3 +137,20 @@
 - ?? examples/kanban_board.rs
 
 ---
+
+## 2026-07-03T05:53:20Z — 1. Fixed a concurrency race condition in `src/lib.rs` by making `SubOption::Once` callback retrieval/cleanup atomic during the collection phase before callback execution.
+2. Cleaned up dead/redundant error handling code in `src/lib.rs` (removed `PubSubError::LockPoisoned` variant and streamlined matches).
+3. Wrapped `KanbanState` in `Arc` in `AppEvent::StateUpdated(Arc<KanbanState>)` for zero-copy performance.
+4. Refactored the `KeyboardDispatcher` in `examples/kanban_board.rs` to be completely stateless, publishing raw inputs asynchronously to a `"ui_input"` channel using non-blocking `crossterm::event::EventStream` and `futures::StreamExt` instead of a thread-blocking sync loop.
+5. Moved input-routing and editing logic from the keyboard loop into `StateManager`, establishing a single source of truth for app state and fixing a critical bug where edit mode was broken.
+6. Cleaned up code format, fixed Clippy suggestions, and successfully ran and passed all unit and integration tests.
+
+**Reason:** Completed all requested architectural refinements and codebase improvements in ez_pubsub and its ratatui kanban board example.
+
+**Files modified:**
+- M Cargo.lock
+- M Cargo.toml
+- M examples/kanban_board.rs
+- M src/lib.rs
+
+---

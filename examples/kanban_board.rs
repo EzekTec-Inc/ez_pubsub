@@ -70,7 +70,7 @@ pub enum AppEvent {
     ActionBackspace,
     ActionSubmitEdit,
     ActionQuit,
-    StateUpdated(KanbanState),
+    StateUpdated(Arc<KanbanState>),
 }
 
 pub struct StateManager {
@@ -87,6 +87,106 @@ impl StateManager {
     }
 
     pub async fn run(self) {
+        let state = self.state.clone();
+        let pubsub = self.pubsub.clone();
+
+        // Subscribe to UI input (key presses) and translate them to Actions
+        self.pubsub
+            .subscribe(
+                "ui_input",
+                "state_manager_ui_input_cb",
+                "state_manager",
+                SubOption::Always,
+                move |event_msg| {
+                    let state = state.clone();
+                    let pubsub = pubsub.clone();
+                    async move {
+                        if let AppEvent::UiInput(key) = &*event_msg {
+                            let current_mode = state.lock().await.input_mode.clone();
+                            match current_mode {
+                                InputMode::Editing => match key.code {
+                                    KeyCode::Enter => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionSubmitEdit)
+                                            .await;
+                                    }
+                                    KeyCode::Esc => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionCancelEditMode)
+                                            .await;
+                                    }
+                                    KeyCode::Backspace => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionBackspace)
+                                            .await;
+                                    }
+                                    KeyCode::Char(c) => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionTypeChar(c))
+                                            .await;
+                                    }
+                                    _ => {}
+                                },
+                                InputMode::Normal => match key.code {
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        let _ = pubsub
+                                            .publish(
+                                                "action",
+                                                AppEvent::ActionMoveFocused(Direction::Right),
+                                            )
+                                            .await;
+                                    }
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        let _ = pubsub
+                                            .publish(
+                                                "action",
+                                                AppEvent::ActionMoveFocused(Direction::Left),
+                                            )
+                                            .await;
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionFocusNext)
+                                            .await;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionFocusPrevious)
+                                            .await;
+                                    }
+                                    KeyCode::Char('a') => {
+                                        let _ = pubsub
+                                            .publish(
+                                                "action",
+                                                AppEvent::ActionCreateTicket("New Task".into()),
+                                            )
+                                            .await;
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Enter => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionEnterEditMode)
+                                            .await;
+                                    }
+                                    KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                                        let _ = pubsub
+                                            .publish("action", AppEvent::ActionDeleteFocused)
+                                            .await;
+                                    }
+                                    KeyCode::Char('q') => {
+                                        let _ =
+                                            pubsub.publish("action", AppEvent::ActionQuit).await;
+                                    }
+                                    _ => {}
+                                },
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .expect("Failed to subscribe UI input");
+
         let state = self.state.clone();
         let pubsub = self.pubsub.clone();
 
@@ -121,7 +221,7 @@ impl StateManager {
                                         _ => {}
                                     }
                                 }
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -134,7 +234,7 @@ impl StateManager {
                                     title: title.clone(),
                                     status: Column::Todo,
                                 });
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -145,7 +245,7 @@ impl StateManager {
                                 if st.focused_ticket_id == Some(*id) {
                                     st.focused_ticket_id = st.tickets.first().map(|t| t.id);
                                 }
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -155,24 +255,24 @@ impl StateManager {
                                 if let Some(focused_id) = st.focused_ticket_id
                                     && let Some(ticket) =
                                         st.tickets.iter_mut().find(|t| t.id == focused_id)
-                                    {
-                                        match (ticket.status, dir) {
-                                            (Column::Todo, Direction::Right) => {
-                                                ticket.status = Column::InProgress
-                                            }
-                                            (Column::InProgress, Direction::Right) => {
-                                                ticket.status = Column::Done
-                                            }
-                                            (Column::Done, Direction::Left) => {
-                                                ticket.status = Column::InProgress
-                                            }
-                                            (Column::InProgress, Direction::Left) => {
-                                                ticket.status = Column::Todo
-                                            }
-                                            _ => {}
+                                {
+                                    match (ticket.status, dir) {
+                                        (Column::Todo, Direction::Right) => {
+                                            ticket.status = Column::InProgress
                                         }
+                                        (Column::InProgress, Direction::Right) => {
+                                            ticket.status = Column::Done
+                                        }
+                                        (Column::Done, Direction::Left) => {
+                                            ticket.status = Column::InProgress
+                                        }
+                                        (Column::InProgress, Direction::Left) => {
+                                            ticket.status = Column::Todo
+                                        }
+                                        _ => {}
                                     }
-                                let cloned_state = st.clone();
+                                }
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -188,7 +288,7 @@ impl StateManager {
                                     let next_idx = (curr_idx + 1) % st.tickets.len();
                                     st.focused_ticket_id = Some(st.tickets[next_idx].id);
                                 }
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -208,7 +308,7 @@ impl StateManager {
                                     };
                                     st.focused_ticket_id = Some(st.tickets[next_idx].id);
                                 }
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -219,7 +319,7 @@ impl StateManager {
                                     st.tickets.retain(|t| t.id != focused_id);
                                     st.focused_ticket_id = st.tickets.first().map(|t| t.id);
                                 }
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -229,11 +329,11 @@ impl StateManager {
                                 if let Some(focused_id) = st.focused_ticket_id
                                     && let Some(ticket) =
                                         st.tickets.iter().find(|t| t.id == focused_id)
-                                    {
-                                        st.input_buffer = ticket.title.clone();
-                                        st.input_mode = InputMode::Editing;
-                                    }
-                                let cloned_state = st.clone();
+                                {
+                                    st.input_buffer = ticket.title.clone();
+                                    st.input_mode = InputMode::Editing;
+                                }
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -242,7 +342,7 @@ impl StateManager {
                                 let mut st = state.lock().await;
                                 st.input_mode = InputMode::Normal;
                                 st.input_buffer.clear();
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -254,12 +354,12 @@ impl StateManager {
                                     if let Some(focused_id) = st.focused_ticket_id
                                         && let Some(ticket) =
                                             st.tickets.iter_mut().find(|t| t.id == focused_id)
-                                        {
-                                            ticket.title = new_title;
-                                        }
+                                    {
+                                        ticket.title = new_title;
+                                    }
                                     st.input_mode = InputMode::Normal;
                                     st.input_buffer.clear();
-                                    let cloned_state = st.clone();
+                                    let cloned_state = Arc::new(st.clone());
                                     let _ = pubsub
                                         .publish(
                                             "state_update",
@@ -272,7 +372,7 @@ impl StateManager {
                                 let mut st = state.lock().await;
                                 if st.input_mode == InputMode::Editing {
                                     st.input_buffer.push(*c);
-                                    let cloned_state = st.clone();
+                                    let cloned_state = Arc::new(st.clone());
                                     let _ = pubsub
                                         .publish(
                                             "state_update",
@@ -285,7 +385,7 @@ impl StateManager {
                                 let mut st = state.lock().await;
                                 if st.input_mode == InputMode::Editing {
                                     st.input_buffer.pop();
-                                    let cloned_state = st.clone();
+                                    let cloned_state = Arc::new(st.clone());
                                     let _ = pubsub
                                         .publish(
                                             "state_update",
@@ -297,7 +397,7 @@ impl StateManager {
                             AppEvent::ActionQuit => {
                                 let mut st = state.lock().await;
                                 st.quit = true;
-                                let cloned_state = st.clone();
+                                let cloned_state = Arc::new(st.clone());
                                 let _ = pubsub
                                     .publish("state_update", AppEvent::StateUpdated(cloned_state))
                                     .await;
@@ -339,7 +439,7 @@ impl KanbanApp {
                     let state = state.clone();
                     async move {
                         if let AppEvent::StateUpdated(new_state) = &*event_msg {
-                            *state.lock().await = new_state.clone();
+                            *state.lock().await = (**new_state).clone();
                         }
                         Ok(())
                     }
@@ -429,105 +529,29 @@ impl KanbanApp {
 
 pub struct KeyboardDispatcher {
     pubsub: Arc<PubSub<AppEvent>>,
-    state: Arc<Mutex<KanbanState>>,
 }
 
 impl KeyboardDispatcher {
-    pub fn new(pubsub: Arc<PubSub<AppEvent>>, state: Arc<Mutex<KanbanState>>) -> Self {
-        Self { pubsub, state }
+    pub fn new(pubsub: Arc<PubSub<AppEvent>>) -> Self {
+        Self { pubsub }
     }
 
     pub async fn run(self) {
-        let pubsub = self.pubsub.clone();
-        let state = self.state.clone();
+        use crossterm::event::EventStream;
+        use futures::StreamExt;
 
-        let _ = tokio::task::spawn_blocking(move || {
-            loop {
-                if let Ok(Event::Key(key)) = event::read() {
-                    let pubsub = pubsub.clone();
-                    let state = state.clone();
-
-                    tokio::spawn(async move {
-                        let _ = pubsub.publish("ui_input", AppEvent::UiInput(key)).await;
-
-                        let is_editing = state.lock().await.input_mode == InputMode::Editing;
-                        if is_editing {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    let _ =
-                                        pubsub.publish("action", AppEvent::ActionSubmitEdit).await;
-                                }
-                                KeyCode::Esc => {
-                                    let _ = pubsub
-                                        .publish("action", AppEvent::ActionCancelEditMode)
-                                        .await;
-                                }
-                                KeyCode::Backspace => {
-                                    let _ =
-                                        pubsub.publish("action", AppEvent::ActionBackspace).await;
-                                }
-                                KeyCode::Char(c) => {
-                                    let _ =
-                                        pubsub.publish("action", AppEvent::ActionTypeChar(c)).await;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Right | KeyCode::Char('l') => {
-                                    let _ = pubsub
-                                        .publish(
-                                            "action",
-                                            AppEvent::ActionMoveFocused(Direction::Right),
-                                        )
-                                        .await;
-                                }
-                                KeyCode::Left | KeyCode::Char('h') => {
-                                    let _ = pubsub
-                                        .publish(
-                                            "action",
-                                            AppEvent::ActionMoveFocused(Direction::Left),
-                                        )
-                                        .await;
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let _ =
-                                        pubsub.publish("action", AppEvent::ActionFocusNext).await;
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let _ = pubsub
-                                        .publish("action", AppEvent::ActionFocusPrevious)
-                                        .await;
-                                }
-                                KeyCode::Char('a') => {
-                                    let _ = pubsub
-                                        .publish(
-                                            "action",
-                                            AppEvent::ActionCreateTicket("New Task".into()),
-                                        )
-                                        .await;
-                                }
-                                KeyCode::Char('e') | KeyCode::Enter => {
-                                    let _ = pubsub
-                                        .publish("action", AppEvent::ActionEnterEditMode)
-                                        .await;
-                                }
-                                KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
-                                    let _ = pubsub
-                                        .publish("action", AppEvent::ActionDeleteFocused)
-                                        .await;
-                                }
-                                KeyCode::Char('q') => {
-                                    let _ = pubsub.publish("action", AppEvent::ActionQuit).await;
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
+        let mut reader = EventStream::new();
+        while let Some(Ok(event)) = reader.next().await {
+            if let Event::Key(key) = event {
+                // Ignore key release events to avoid double-processing
+                if key.kind != event::KeyEventKind::Release {
+                    let _ = self
+                        .pubsub
+                        .publish("ui_input", AppEvent::UiInput(key))
+                        .await;
                 }
             }
-        })
-        .await;
+        }
     }
 }
 
@@ -552,8 +576,7 @@ async fn main() -> io::Result<()> {
         state_manager.run().await;
     });
 
-    let dispatcher =
-        KeyboardDispatcher::new(pubsub.clone(), Arc::new(Mutex::new(initial_state.clone())));
+    let dispatcher = KeyboardDispatcher::new(pubsub.clone());
     tokio::spawn(async move {
         dispatcher.run().await;
     });
@@ -608,7 +631,7 @@ mod tests {
                     let state_rx = state_rx.clone();
                     async move {
                         if let AppEvent::StateUpdated(st) = &*msg {
-                            *state_rx.lock().await = Some(st.clone());
+                            *state_rx.lock().await = Some((**st).clone());
                         }
                         Ok(())
                     }
@@ -661,7 +684,10 @@ mod tests {
             quit: false,
         };
         pubsub
-            .publish("state_update", AppEvent::StateUpdated(new_state.clone()))
+            .publish(
+                "state_update",
+                AppEvent::StateUpdated(Arc::new(new_state.clone())),
+            )
             .await
             .unwrap();
 
@@ -675,15 +701,7 @@ mod tests {
     #[tokio::test]
     async fn test_keyboard_dispatcher_broadcasts_events() {
         let pubsub = Arc::new(PubSub::<AppEvent>::new());
-        let initial_state = KanbanState {
-            tickets: vec![],
-            focused_ticket_id: None,
-            input_mode: InputMode::Normal,
-            input_buffer: String::new(),
-            quit: false,
-        };
-        let _dispatcher =
-            KeyboardDispatcher::new(pubsub.clone(), Arc::new(Mutex::new(initial_state)));
+        let _dispatcher = KeyboardDispatcher::new(pubsub.clone());
 
         let received = Arc::new(Mutex::new(false));
         let rx = received.clone();
